@@ -1,0 +1,1 @@
+{"datasets": [{"metric": "Price", "label": "Price on NSE", "values": [["2026-10-20", "990.00"], ["2026-10-21", "1000.00"]]}, {"metric": "DMA50", "label": "50 DMA", "values": [["2026-10-20", "950.10"], ["2026-10-21", "951.00"]]}, {"metric": "Volume", "label": "Volume", "values": [["2026-10-20", 12000, {"delivery": 55}], ["2026-10-21", 15000, {"delivery": 60}]]}]}
