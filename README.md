@@ -133,8 +133,11 @@ s.set_bse_codes({"KINGSINFR": "530215", "GENUSPRIME": "532425"})
 ```
 
 When a company's **consolidated** page is thin (fewer than 8 quarters or 5 years — common right after a
-subsidiary is formed), the standalone page is fetched too and the one with more history is used.
-Responses say which view was used and why (`view`, `view_note`, `history`).
+subsidiary is formed), the standalone page is fetched too. The latest figures and ratios stay consolidated
+and older columns are filled from standalone; each table's `basis` list says which columns are which, and
+growth or red-flag checks never compare across the join. If the consolidated page is too new for
+trailing-12-month figures (under 4 quarters), the standalone page is used instead. Responses say what
+happened (`view`, `view_note`, `history`, `history_fill`).
 
 Batch jobs share the same machine-wide governor as the MCP server, so a nightly script and an
 assistant session can run side by side without tripping Screener's limits.

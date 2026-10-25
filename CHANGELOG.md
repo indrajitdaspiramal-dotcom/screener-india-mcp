@@ -2,6 +2,19 @@
 
 All notable changes are documented here (format: [Keep a Changelog](https://keepachangelog.com/)).
 
+## [0.1.2] — 2026-10-26
+
+### Changed
+- A thin consolidated page (fewer than 8 quarters or 5 years) no longer gives way to the standalone page.
+  The latest figures and ratios stay **consolidated** (subsidiaries included); older columns are filled
+  from the standalone page. Every table now carries a `basis` list (`consolidated` / `standalone` per
+  column) and the response says what was filled (`history_fill`).
+- Earnings-trend YoY growth is never computed across the join (a consolidated quarter is not compared with
+  a standalone one). Red-flag checks use one basis only: the consolidated columns when they hold at least
+  4 years, otherwise the whole standalone page (`basis` in the result says which).
+- A consolidated page too new to have trailing-12-month figures (fewer than 4 quarters or no full year)
+  is not used as the main source, because its P/E and returns would be unreliable; the standalone page is.
+
 ## [0.1.1] — 2026-10-25
 
 ### Fixed
