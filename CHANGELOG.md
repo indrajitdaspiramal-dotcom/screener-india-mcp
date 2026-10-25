@@ -15,6 +15,14 @@ All notable changes are documented here (format: [Keep a Changelog](https://keep
 - A consolidated page too new to have trailing-12-month figures (fewer than 4 quarters or no full year)
   is not used as the main source, because its P/E and returns would be unreliable; the standalone page is.
 
+### Fixed
+- An out-of-date consolidated page (a company that stopped publishing consolidated results years ago) could
+  be taken as the latest numbers — one real example ended in Dec 2017 with a P/E of 913. If the consolidated
+  page's newest quarter is older than the standalone page's, or more than 9 months old, the standalone page
+  is checked and used.
+- Year-on-year growth now compares with the same period one year earlier, matched by date. Before, it took
+  the column four places back, which for half-yearly (SME) reporters is two years earlier.
+
 ## [0.1.1] — 2026-10-25
 
 ### Fixed
