@@ -37,11 +37,89 @@ THIN_QUARTERS = 8          # a consolidated page with fewer quarters OR fewer P&
 THIN_YEARS = 5             # the standalone page is fetched too and the one with more history wins
 
 
+MIN_PRIMARY_QUARTERS = 4  # below this a consolidated page has no trailing-12-month figures, so its P/E etc.
+MIN_PRIMARY_YEARS = 1     # are unreliable and the standalone page is used as the main source instead
+HISTORY_TABLES = ("quarters", "profit_loss", "balance_sheet", "cash_flow", "ratios_history")
+_MONTHS = {m: i for i, m in enumerate(("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct",
+                                        "nov", "dec"), 1)}
+
+
 def _depth(d: dict) -> tuple[int, int]:
     """(P&L years, quarters) of a parsed company page."""
     def n(key):
         return len(((d.get(key) or {}).get("periods")) or [])
     return n("profit_loss"), n("quarters")
+
+
+def _period_keys(table: dict) -> list[Optional[str]]:
+    """'YYYY-MM' per column (from Screener's date keys, else the 'Mar 2024' label); None for TTM etc."""
+    dates = table.get("period_end_dates") or [None] * len(table.get("periods") or [])
+    out = []
+    for label, date in zip(table.get("periods") or [], dates):
+        if date and re.match(r"^\d{4}-\d{2}", str(date)):
+            out.append(str(date)[:7])
+            continue
+        m = re.match(r"^\s*([A-Za-z]{3})[a-z]*\s+(\d{4})\s*$", str(label or ""))
+        out.append("%s-%02d" % (m.group(2), _MONTHS[m.group(1).lower()]) if m and m.group(1).lower() in _MONTHS
+                   else None)
+    return out
+
+
+def _backfill(cons: Optional[dict], stand: Optional[dict]) -> tuple[Optional[dict], int]:
+    """Consolidated table with OLDER periods taken from the standalone table. Every column carries its basis
+    ('consolidated' / 'standalone') so growth across the join is never read as like-for-like. Rows stay the
+    consolidated row set. Returns (table, number of columns added)."""
+    if not stand or not stand.get("periods"):
+        if cons:
+            cons = dict(cons, basis=["consolidated"] * len(cons["periods"]))
+        return cons, 0
+    if not cons or not cons.get("periods"):
+        return dict(stand, basis=["standalone"] * len(stand["periods"])), len(stand["periods"])
+    ckeys = [k for k in _period_keys(cons) if k]
+    if not ckeys:
+        return dict(cons, basis=["consolidated"] * len(cons["periods"])), 0
+    first = min(ckeys)
+    skeys = _period_keys(stand)
+    take = [i for i, k in enumerate(skeys) if k and k < first]
+    if not take:
+        return dict(cons, basis=["consolidated"] * len(cons["periods"])), 0
+    srows = {k.lower(): v for k, v in (stand.get("rows") or {}).items()}
+
+    def pick(vals, i):
+        return vals[i] if vals and i < len(vals) else None
+    rows = {}
+    for label, vals in (cons.get("rows") or {}).items():
+        old = srows.get(label.lower())
+        rows[label] = [pick(old, i) for i in take] + list(vals)
+    sdates = stand.get("period_end_dates") or [None] * len(stand["periods"])
+    cdates = cons.get("period_end_dates") or [None] * len(cons["periods"])
+    dates = [sdates[i] if i < len(sdates) else None for i in take] + list(cdates)
+    return {"periods": [stand["periods"][i] for i in take] + list(cons["periods"]),
+            "period_end_dates": dates if any(dates) else None, "rows": rows,
+            "basis": ["standalone"] * len(take) + ["consolidated"] * len(cons["periods"])}, len(take)
+
+
+def _combine(cons: dict, stand: dict) -> dict:
+    """Option B (25-Oct-2026): latest figures and ratios from the CONSOLIDATED page (subsidiaries included),
+    older history filled from the STANDALONE page and labelled as such."""
+    data = dict(cons)
+    added = {}
+    for key in HISTORY_TABLES:
+        data[key], n = _backfill(cons.get(key), stand.get(key))
+        if n:
+            added[key] = n
+    csh = (cons.get("shareholding") or {}).get("quarterly") or {}
+    ssh = (stand.get("shareholding") or {}).get("quarterly") or {}
+    if len(ssh.get("periods") or []) > len(csh.get("periods") or []):   # company-level, same on both pages
+        data["shareholding"] = stand.get("shareholding")
+    data["view"] = "consolidated"
+    data["history_fill"] = {"from": "standalone", "columns_added": added}
+    cy, cq = _depth(cons)
+    data["view_note"] = ("latest figures and ratios are consolidated; the consolidated page has only %d quarters "
+                         "and %d years, so older columns come from the standalone page (marked 'standalone' in "
+                         "each table's basis; growth across the join is not like-for-like)" % (cq, cy))
+    data["_standalone"] = stand
+    return data
 
 
 class Screener:
@@ -101,43 +179,63 @@ class Screener:
                 return hits[0]["symbol"].upper()
         return None
 
+    def _fetch_view(self, slug: str, suffix: str) -> tuple[Page, dict]:
+        page = self.client.fetch("/company/%s/%s" % (slug, suffix), kind="company")
+        if not parsers.page_has_company_data(page.text):
+            raise ParseError("Screener.in page for %s had no company data." % slug)
+        data = parsers.parse_company_page(page.text)
+        if not data.get("view"):
+            data["view"] = "consolidated" if suffix else "standalone"
+        return page, data
+
     def _load(self, slug: str, view: str) -> tuple[Page, dict]:
-        """Fetch one company page. In 'auto', a thin consolidated page also fetches standalone and keeps
-        whichever has more history (born 25-Oct-2026: SGFIN consolidated = 1 quarter, 0 P&L years)."""
-        order = {"consolidated": ["consolidated/"], "standalone": [""]}.get(view, ["consolidated/", ""])
+        """Fetch one company page. In 'auto' (born 25-Oct-2026 from a 91-holding test):
+        * consolidated rich enough -> consolidated only (one request);
+        * consolidated thin (< 8 quarters or < 5 years) -> also fetch standalone; keep the CONSOLIDATED latest
+          figures and fill older columns from standalone, labelled per column (``basis``);
+        * consolidated too new to have trailing-12-month figures (< 4 quarters or no full year, e.g. SGFIN with
+          1 quarter) -> its P/E and returns are unreliable, so the standalone page is the main source;
+        * no consolidated page / no consolidated figures -> standalone."""
+        if view in ("consolidated", "standalone"):
+            page, data = self._fetch_view(slug, "consolidated/" if view == "consolidated" else "")
+            return page, self._stamp(data)
+        cons: Optional[tuple[Page, dict]] = None
         last_err: Exception | None = None
-        best: Optional[tuple[Page, dict]] = None
-        for suffix in order:
-            try:
-                page = self.client.fetch("/company/%s/%s" % (slug, suffix), kind="company")
-            except NotFound as exc:
-                last_err = exc
-                continue
-            if not parsers.page_has_company_data(page.text):
-                last_err = ParseError("Screener.in page for %s had no company data." % slug)
-                continue
-            data = parsers.parse_company_page(page.text)
-            if not data.get("view"):
-                data["view"] = "consolidated" if suffix else "standalone"
-            if suffix and view == "auto" and not data.get("quarters"):
-                last_err = ParseError("No consolidated figures for %s." % slug)
-                continue
-            if best is None or _depth(data) > _depth(best[1]):
-                if best is not None:
-                    py, pq = _depth(best[1])
-                    data["view_note"] = ("standalone used: the consolidated page has only %d quarters and "
-                                         "%d years of results" % (pq, py))
-                best = (page, data)
-            years, quarters = _depth(best[1])
-            if view != "auto" or not suffix or (quarters >= THIN_QUARTERS and years >= THIN_YEARS):
-                break                                   # rich enough (or standalone already checked)
-        if best is None:
-            raise last_err or NotFound("No Screener.in page for %s." % slug)
-        page, data = best
+        try:
+            cons = self._fetch_view(slug, "consolidated/")
+            if not cons[1].get("quarters"):
+                cons, last_err = None, ParseError("No consolidated figures for %s." % slug)
+        except (NotFound, ParseError) as exc:
+            last_err = exc
+        if cons is not None:
+            cy, cq = _depth(cons[1])
+            if cq >= THIN_QUARTERS and cy >= THIN_YEARS:
+                return cons[0], self._stamp(cons[1])
+        try:
+            stand = self._fetch_view(slug, "")
+        except (NotFound, ParseError) as exc:
+            if cons is None:
+                raise last_err or exc
+            return cons[0], self._stamp(cons[1])
+        if cons is None:
+            return stand[0], self._stamp(stand[1])
+        cy, cq = _depth(cons[1])
+        sy, sq = _depth(stand[1])
+        if sy <= cy and sq <= cq:
+            return cons[0], self._stamp(cons[1])        # standalone adds nothing
+        if cq < MIN_PRIMARY_QUARTERS or cy < MIN_PRIMARY_YEARS:
+            data = stand[1]
+            data["view_note"] = ("standalone used: the consolidated page has only %d quarters and %d years, too "
+                                 "new for trailing-12-month figures" % (cq, cy))
+            return stand[0], self._stamp(data)
+        return cons[0], self._stamp(_combine(cons[1], stand[1]))
+
+    @staticmethod
+    def _stamp(data: dict) -> dict:
         years, quarters = _depth(data)
         data["history"] = {"pl_years": years, "quarters": quarters,
                            "short": years < THIN_YEARS and quarters < THIN_QUARTERS}
-        return page, data
+        return data
 
     def _company_page(self, symbol: str, view: str = "auto", name: str = "") -> tuple[str, Page, dict]:
         sym = self._norm(symbol)
@@ -165,7 +263,8 @@ class Screener:
         raise last_err
 
     def _prov(self, page: Page, data: dict) -> dict:
-        return page.provenance(view=data.get("view"), units="₹ crore unless stated")
+        extra = {k: data.get(k) for k in ("view_note", "history", "history_fill") if data.get(k) is not None}
+        return page.provenance(view=data.get("view"), units="₹ crore unless stated", **extra)
 
     # ---------------------------------------------------------------- company
     def overview(self, symbol: str, view: str = "auto") -> dict:

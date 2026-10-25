@@ -54,6 +54,31 @@ def pct_change(new: Optional[float], old: Optional[float]) -> Optional[float]:
     return round((new - old) / abs(old) * 100.0, 1)
 
 
+def _only(table: Optional[dict], basis: str) -> Optional[dict]:
+    """The columns of one basis ('consolidated' / 'standalone') from a back-filled table."""
+    if not table or not table.get("basis"):
+        return table
+    keep = [i for i, b in enumerate(table["basis"]) if b == basis]
+    dates = table.get("period_end_dates")
+    return {"periods": [table["periods"][i] for i in keep],
+            "period_end_dates": [dates[i] for i in keep] if dates else None,
+            "rows": {k: [v[i] if i < len(v) else None for i in keep] for k, v in table["rows"].items()}}
+
+
+def _consistent(company: dict) -> tuple[dict, Optional[str]]:
+    """Multi-year checks must not compare a standalone year with a consolidated one. If the page was back-filled,
+    use the consolidated columns when they hold at least 4 years, else the whole standalone page."""
+    pl = company.get("profit_loss")
+    if not pl or not pl.get("basis") or "standalone" not in pl["basis"]:
+        return company, None
+    cons = dict(company)
+    for key in ("profit_loss", "balance_sheet", "cash_flow", "ratios_history"):
+        cons[key] = _only(company.get(key), "consolidated")
+    if len(_annual(cons.get("profit_loss"), "sales", "revenue", "net profit")) >= 4 or not company.get("_standalone"):
+        return cons, "consolidated"
+    return company["_standalone"], "standalone"
+
+
 # ---------------------------------------------------------------- earnings trend
 def earnings_trend(company: dict, quarters: int = 8) -> dict:
     """Quarterly sales/profit with YoY growth and whether growth is accelerating."""
@@ -66,20 +91,25 @@ def earnings_trend(company: dict, quarters: int = 8) -> dict:
     opm = _row(q, "opm %", "financing margin %")
     np_ = _row(q, "net profit")
     eps = _row(q, "eps in rs", "eps")
+    basis = q.get("basis") or [None] * len(periods)
     out = []
     for i, p in enumerate(periods):
         def at(series, j=i):
             return series[j] if 0 <= j < len(series) else None
-        out.append({
+        same = i >= 4 and at(basis) == at(basis, i - 4)     # never YoY across standalone -> consolidated
+        row = {
             "period": p,
             "sales_cr": at(sales),
             "operating_profit_cr": at(op),
             "opm_pct": at(opm),
             "net_profit_cr": at(np_),
             "eps": at(eps),
-            "sales_yoy_pct": pct_change(at(sales), at(sales, i - 4)) if i >= 4 else None,
-            "profit_yoy_pct": pct_change(at(np_), at(np_, i - 4)) if i >= 4 else None,
-        })
+            "sales_yoy_pct": pct_change(at(sales), at(sales, i - 4)) if same else None,
+            "profit_yoy_pct": pct_change(at(np_), at(np_, i - 4)) if same else None,
+        }
+        if at(basis):
+            row["basis"] = at(basis)
+        out.append(row)
     out = out[-quarters:]
     s_yoy = [r["sales_yoy_pct"] for r in out if r["sales_yoy_pct"] is not None]
     p_yoy = [r["profit_yoy_pct"] for r in out if r["profit_yoy_pct"] is not None]
@@ -105,6 +135,7 @@ def _flag(check, status, severity, evidence):
 
 
 def red_flags(company: dict) -> dict:
+    company, basis = _consistent(company)
     pl, bs, cf, rh = (company.get(k) for k in ("profit_loss", "balance_sheet", "cash_flow", "ratios_history"))
     sh = (company.get("shareholding") or {}).get("quarterly")
     checks = []
@@ -203,7 +234,7 @@ def red_flags(company: dict) -> dict:
     flagged = [c for c in checks if c["status"] == "flag"]
     order = {"high": 0, "medium": 1, "low": 2}
     flagged.sort(key=lambda c: order.get(c["severity"] or "low", 3))
-    return {
+    out = {
         "summary": "%d of %d checks flagged" % (len(flagged), sum(1 for c in checks if c["status"] != "na")),
         "flags": flagged,
         "checks": checks,
@@ -212,6 +243,11 @@ def red_flags(company: dict) -> dict:
         + (["asset quality (GNPA/NNPA trend)", "capital adequacy"] if is_lender else []),
         "note": "Screening rules on reported numbers, not a forensic audit. Read the annual report before acting.",
     }
+    if basis:
+        out["basis"] = basis
+        out["basis_note"] = ("checks use %s figures only, so no comparison crosses standalone and consolidated "
+                             "years" % basis)
+    return out
 
 
 # ---------------------------------------------------------------- compare
