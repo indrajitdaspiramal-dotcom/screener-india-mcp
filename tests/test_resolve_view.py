@@ -12,12 +12,28 @@ from screener_india_mcp.service import Screener
 from test_governor_client import make
 
 
-def table(n):
-    return {"periods": ["P%d" % i for i in range(n)], "rows": {"Sales": [1.0] * n}}
+MON = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
+def table(n, step, end, value):
+    """n dated columns ending at `end` (year, month), `step` months apart, every value = `value`."""
+    y, m = end
+    labels = []
+    for _ in range(n):
+        labels.append("%s %d" % (MON[m - 1], y))
+        m -= step
+        while m < 1:
+            m += 12
+            y -= 1
+    labels.reverse()
+    return {"periods": labels, "period_end_dates": None,
+            "rows": {"Sales": [value] * n, "Net Profit": [value] * n}}
 
 
 def fake_page(quarters, years, view):
-    return {"name": "X", "view": view, "quarters": table(quarters), "profit_loss": table(years)}
+    v = 2.0 if view == "consolidated" else 1.0       # tell the two pages' numbers apart
+    return {"name": "X", "view": view, "quarters": table(quarters, 3, (2026, 9), v) if quarters else None,
+            "profit_loss": table(years, 12, (2026, 3), v) if years else None}
 
 
 @pytest.fixture
@@ -62,6 +78,53 @@ def test_thin_consolidated_loses_to_standalone(tmp_path, pages):
     _, _, d = Screener(c)._company_page("SGFIN")
     assert d["view"] == "standalone" and "only 1 quarters" in d["view_note"]
     assert len(calls) == 2
+
+
+def test_thin_consolidated_keeps_latest_and_fills_history_from_standalone(tmp_path, pages):
+    """Option B: the latest numbers stay consolidated (subsidiaries included); older columns come from the
+    standalone page, labelled, and no YoY or multi-year check crosses the join."""
+    from screener_india_mcp import analytics
+    spec, h = pages
+    spec["/company/KREONFIN/consolidated/"] = (6, 3)
+    spec["/company/KREONFIN/"] = (13, 10)
+    c, calls, _ = make(tmp_path, h)
+    _, page, d = Screener(c)._company_page("KREONFIN")
+    assert d["view"] == "consolidated" and page.url.endswith("/consolidated/") and len(calls) == 2
+    q, pl = d["quarters"], d["profit_loss"]
+    assert len(q["periods"]) == 13 and q["basis"] == ["standalone"] * 7 + ["consolidated"] * 6
+    assert q["rows"]["Sales"][:7] == [1.0] * 7 and q["rows"]["Sales"][7:] == [2.0] * 6
+    assert q["periods"][6] == "Mar 2025" and q["periods"][7] == "Jun 2025"    # contiguous, no overlap
+    assert len(pl["periods"]) == 10 and pl["basis"].count("consolidated") == 3
+    assert d["history_fill"]["columns_added"] == {"quarters": 7, "profit_loss": 7}
+    assert d["history"]["short"] is False and "consolidated" in d["view_note"]
+    tr = analytics.earnings_trend(d, 13)["quarters"]
+    assert [r["sales_yoy_pct"] for r in tr][7:11] == [None] * 4        # consolidated vs standalone: no YoY
+    assert tr[11]["sales_yoy_pct"] == 0.0                               # consolidated vs consolidated: fine
+    rf = analytics.red_flags(d)
+    assert rf["basis"] == "standalone"            # only 3 consolidated years -> whole standalone page
+    prov = Screener(c)._prov(page, d)
+    assert prov["history_fill"]["from"] == "standalone" and "_standalone" not in prov
+
+
+def test_too_new_consolidated_uses_standalone_as_primary(tmp_path, pages):
+    spec, h = pages
+    spec["/company/NEWSUB/consolidated/"] = (3, 4)      # < 4 quarters: no trailing-12-month P/E
+    spec["/company/NEWSUB/"] = (13, 10)
+    c, _, _ = make(tmp_path, h)
+    _, page, d = Screener(c)._company_page("NEWSUB")
+    assert d["view"] == "standalone" and "trailing-12-month" in d["view_note"] and "basis" not in d["quarters"]
+
+
+def test_backfill_uses_date_keys_and_skips_ttm():
+    from screener_india_mcp.service import _backfill
+    cons = {"periods": ["Mar 2025", "Mar 2026", "TTM"], "period_end_dates": ["2025-03-31", "2026-03-31", None],
+            "rows": {"Sales": [5.0, 6.0, 7.0], "Only Cons": [1.0, 1.0, 1.0]}}
+    stand = {"periods": ["Mar 2023", "Mar 2024", "Mar 2025", "TTM"], "period_end_dates": None,
+             "rows": {"sales": [1.0, 2.0, 3.0, 4.0]}}
+    t, n = _backfill(cons, stand)
+    assert n == 2 and t["periods"] == ["Mar 2023", "Mar 2024", "Mar 2025", "Mar 2026", "TTM"]
+    assert t["rows"]["Sales"] == [1.0, 2.0, 5.0, 6.0, 7.0] and t["rows"]["Only Cons"][:2] == [None, None]
+    assert t["basis"] == ["standalone", "standalone", "consolidated", "consolidated", "consolidated"]
 
 
 def test_thin_consolidated_kept_when_standalone_is_thinner(tmp_path, pages):
