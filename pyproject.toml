@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "screener-india-mcp"
-version = "0.1.0"
+version = "0.1.1"
 description = "Screener India MCP — the rate-safe, source-traced Screener.in server for AI assistants (Indian NSE/BSE fundamentals)."
 readme = "README.md"
 license = "MIT"

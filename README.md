@@ -123,6 +123,19 @@ snap = s.snapshot("TCS")
 print(snap["overview"]["ratios"]["pe"], snap["red_flags"]["summary"])
 ```
 
+**BSE-only and SME companies** live on Screener under their BSE scrip code (e.g. `/company/530215/`),
+not the ticker. Pass any code you know, or use the code as the symbol; otherwise the library tries a
+Screener search and accepts only an unambiguous match (it never guesses between two companies). A
+match that worked is remembered in `aliases.json` in the state folder.
+
+```python
+s.set_bse_codes({"KINGSINFR": "530215", "GENUSPRIME": "532425"})
+```
+
+When a company's **consolidated** page is thin (fewer than 8 quarters or 5 years — common right after a
+subsidiary is formed), the standalone page is fetched too and the one with more history is used.
+Responses say which view was used and why (`view`, `view_note`, `history`).
+
 Batch jobs share the same machine-wide governor as the MCP server, so a nightly script and an
 assistant session can run side by side without tripping Screener's limits.
 
