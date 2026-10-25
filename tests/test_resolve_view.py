@@ -30,10 +30,17 @@ def table(n, step, end, value):
             "rows": {"Sales": [value] * n, "Net Profit": [value] * n}}
 
 
-def fake_page(quarters, years, view):
+import time
+
+_Y, _M = time.localtime()[:2]
+QEND = (_Y, (_M - 1) // 3 * 3) if _M > 3 else (_Y - 1, 12)       # last completed quarter -> never "stale"
+YEND = (_Y, 3) if _M > 3 else (_Y - 1, 3)
+
+
+def fake_page(quarters, years, view, qend=None, yend=None):
     v = 2.0 if view == "consolidated" else 1.0       # tell the two pages' numbers apart
-    return {"name": "X", "view": view, "quarters": table(quarters, 3, (2026, 9), v) if quarters else None,
-            "profit_loss": table(years, 12, (2026, 3), v) if years else None}
+    return {"name": "X", "view": view, "quarters": table(quarters, 3, qend or QEND, v) if quarters else None,
+            "profit_loss": table(years, 12, yend or YEND, v) if years else None}
 
 
 @pytest.fixture
@@ -42,8 +49,8 @@ def pages(monkeypatch):
     spec: dict = {}
 
     def parse(html):
-        q, y, v = json.loads(html.split("<!--", 1)[1].split("-->", 1)[0])
-        return fake_page(q, y, v)
+        q, y, v, qe, ye = json.loads(html.split("<!--", 1)[1].split("-->", 1)[0])
+        return fake_page(q, y, v, tuple(qe) if qe else None, tuple(ye) if ye else None)
 
     monkeypatch.setattr(parsers, "parse_company_page", parse)
 
@@ -52,9 +59,10 @@ def pages(monkeypatch):
         if path.startswith("/api/company/search/"):
             return httpx.Response(200, json=spec.get("__search__", []))
         if path in spec:
-            q, y = spec[path]
+            q, y, *end = spec[path]
             v = "consolidated" if path.endswith("/consolidated/") else "standalone"
-            return httpx.Response(200, text='<div id="top-ratios"></div><!--%s-->' % json.dumps([q, y, v]))
+            qe, ye = (end + [None, None])[:2]
+            return httpx.Response(200, text='<div id="top-ratios"></div><!--%s-->' % json.dumps([q, y, v, qe, ye]))
         return httpx.Response(404, text="nope")
 
     return spec, handler
@@ -93,7 +101,8 @@ def test_thin_consolidated_keeps_latest_and_fills_history_from_standalone(tmp_pa
     q, pl = d["quarters"], d["profit_loss"]
     assert len(q["periods"]) == 13 and q["basis"] == ["standalone"] * 7 + ["consolidated"] * 6
     assert q["rows"]["Sales"][:7] == [1.0] * 7 and q["rows"]["Sales"][7:] == [2.0] * 6
-    assert q["periods"][6] == "Mar 2025" and q["periods"][7] == "Jun 2025"    # contiguous, no overlap
+    assert analytics._period_keys(q) == sorted(analytics._period_keys(q))     # contiguous, oldest first
+    assert len(set(analytics._period_keys(q))) == 13                          # no overlap at the join
     assert len(pl["periods"]) == 10 and pl["basis"].count("consolidated") == 3
     assert d["history_fill"]["columns_added"] == {"quarters": 7, "profit_loss": 7}
     assert d["history"]["short"] is False and "consolidated" in d["view_note"]
@@ -172,3 +181,32 @@ def test_ambiguous_search_is_refused(tmp_path, pages):
     c, _, _ = make(tmp_path, h)
     with pytest.raises(NotFound):
         Screener(c)._company_page("VALIANT")          # never guess between two different companies
+
+
+def test_stale_rich_consolidated_page_is_not_the_latest(tmp_path, pages):
+    """KREONFIN (25-Oct-2026): the consolidated page stopped in Dec 2017 (P/E 913). Even a 'rich' old page
+    must never stand in for today's numbers."""
+    spec, h = pages
+    spec["/company/OLDCONS/consolidated/"] = (13, 13, (2017, 12), (2017, 3))
+    spec["/company/OLDCONS/"] = (13, 13)
+    c, calls, _ = make(tmp_path, h)
+    _, page, d = Screener(c)._company_page("OLDCONS")
+    assert d["view"] == "standalone" and "out of date" in d["view_note"] and len(calls) == 2
+
+
+def test_stale_thin_consolidated_page_is_not_the_latest(tmp_path, pages):
+    spec, h = pages
+    spec["/company/KREONFIN/consolidated/"] = (10, 2, (2017, 12), (2017, 3))
+    spec["/company/KREONFIN/"] = (13, 13)
+    c, _, _ = make(tmp_path, h)
+    _, _, d = Screener(c)._company_page("KREONFIN")
+    assert d["view"] == "standalone" and "2017-12" in d["view_note"]
+
+
+def test_yoy_is_matched_by_date_for_half_yearly_reporters():
+    """SME companies report half-yearly: 'four columns back' is two years ago, not one."""
+    from screener_india_mcp import analytics
+    q = {"periods": ["Mar 2024", "Sep 2024", "Mar 2025", "Sep 2025", "Mar 2026"], "period_end_dates": None,
+         "rows": {"Sales": [100.0, 110.0, 120.0, 132.0, 150.0], "Net Profit": [10.0, 11.0, 12.0, 13.0, 15.0]}}
+    tr = analytics.earnings_trend({"quarters": q}, 8)["quarters"]
+    assert [r["sales_yoy_pct"] for r in tr] == [None, None, 20.0, 20.0, 25.0]
