@@ -33,9 +33,21 @@ STATEMENTS = {
 }
 
 
+THIN_QUARTERS = 8          # a consolidated page with fewer quarters OR fewer P&L years than these is "thin":
+THIN_YEARS = 5             # the standalone page is fetched too and the one with more history wins
+
+
+def _depth(d: dict) -> tuple[int, int]:
+    """(P&L years, quarters) of a parsed company page."""
+    def n(key):
+        return len(((d.get(key) or {}).get("periods")) or [])
+    return n("profit_loss"), n("quarters")
+
+
 class Screener:
     def __init__(self, client: Optional[ScreenerClient] = None):
         self.client = client or ScreenerClient()
+        self._codes: dict[str, str] = {}          # caller-supplied ticker -> BSE scrip code (fallback page)
 
     # ---------------------------------------------------------------- resolve
     def _norm(self, symbol: str) -> str:
@@ -44,37 +56,113 @@ class Screener:
             raise ScreenerError("A stock symbol is required (NSE symbol like TCS, or BSE code like 500570).")
         return s
 
+    def set_bse_codes(self, codes: dict) -> None:
+        """Ticker -> BSE scrip code. Screener files BSE-only and many SME companies under the BSE code
+        (/company/530215/), so a ticker that is not found is retried with its code."""
+        for k, v in (codes or {}).items():
+            if k and v and str(v).strip().isdigit():
+                self._codes[str(k).strip().upper()] = str(v).strip()
+
+    def _aliases_path(self):
+        return self.client.s.state_dir / "aliases.json"
+
+    def _aliases(self) -> dict:
+        try:
+            return json.loads(self._aliases_path().read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def _remember(self, sym: str, slug: str) -> None:
+        if sym == slug:
+            return
+        a = self._aliases()
+        if a.get(sym) != slug:
+            a[sym] = slug
+            try:
+                self._aliases_path().write_text(json.dumps(a, indent=1, sort_keys=True), encoding="utf-8")
+            except Exception:
+                pass
+
     def search(self, query: str, limit: int = 10) -> dict:
         page = self.client.fetch("/api/company/search/", params={"q": query.strip()}, kind="search", json_api=True)
         res = parsers.parse_search(page.body)[: max(1, limit)]
         return {"query": query, "results": res, "provenance": page.provenance()}
 
-    def _company_page(self, symbol: str, view: str = "auto") -> tuple[str, Page, dict]:
-        sym = self._norm(symbol)
-        if not _SYMBOL.match(sym):
-            hits = self.search(symbol, limit=1)["results"]
-            if not hits or not hits[0].get("symbol"):
-                raise NotFound("No Screener.in company matches '%s'." % symbol)
-            sym = hits[0]["symbol"].upper()
+    def _search_slug(self, sym: str, name: str = "") -> Optional[str]:
+        """Screener's own search, accepted ONLY when it is unambiguous (an exact symbol/code match, or a
+        single result) — a wrong company is worse than no data."""
+        code = self._codes.get(sym)
+        for q in [x for x in (name, sym) if x]:
+            hits = [h for h in self.search(q, limit=10)["results"] if h.get("symbol")]
+            exact = [h for h in hits if h["symbol"].upper() in (sym, code)]
+            if exact:
+                return exact[0]["symbol"].upper()
+            if len(hits) == 1:
+                return hits[0]["symbol"].upper()
+        return None
+
+    def _load(self, slug: str, view: str) -> tuple[Page, dict]:
+        """Fetch one company page. In 'auto', a thin consolidated page also fetches standalone and keeps
+        whichever has more history (born 25-Oct-2026: SGFIN consolidated = 1 quarter, 0 P&L years)."""
         order = {"consolidated": ["consolidated/"], "standalone": [""]}.get(view, ["consolidated/", ""])
         last_err: Exception | None = None
+        best: Optional[tuple[Page, dict]] = None
         for suffix in order:
             try:
-                page = self.client.fetch("/company/%s/%s" % (sym, suffix), kind="company")
+                page = self.client.fetch("/company/%s/%s" % (slug, suffix), kind="company")
             except NotFound as exc:
                 last_err = exc
                 continue
             if not parsers.page_has_company_data(page.text):
-                last_err = ParseError("Screener.in page for %s had no company data." % sym)
+                last_err = ParseError("Screener.in page for %s had no company data." % slug)
                 continue
             data = parsers.parse_company_page(page.text)
             if not data.get("view"):
                 data["view"] = "consolidated" if suffix else "standalone"
             if suffix and view == "auto" and not data.get("quarters"):
-                last_err = ParseError("No consolidated figures for %s." % sym)
+                last_err = ParseError("No consolidated figures for %s." % slug)
                 continue
-            return sym, page, data
-        raise last_err or NotFound("No Screener.in page for %s." % sym)
+            if best is None or _depth(data) > _depth(best[1]):
+                if best is not None:
+                    py, pq = _depth(best[1])
+                    data["view_note"] = ("standalone used: the consolidated page has only %d quarters and "
+                                         "%d years of results" % (pq, py))
+                best = (page, data)
+            years, quarters = _depth(best[1])
+            if view != "auto" or not suffix or (quarters >= THIN_QUARTERS and years >= THIN_YEARS):
+                break                                   # rich enough (or standalone already checked)
+        if best is None:
+            raise last_err or NotFound("No Screener.in page for %s." % slug)
+        page, data = best
+        years, quarters = _depth(data)
+        data["history"] = {"pl_years": years, "quarters": quarters,
+                           "short": years < THIN_YEARS and quarters < THIN_QUARTERS}
+        return page, data
+
+    def _company_page(self, symbol: str, view: str = "auto", name: str = "") -> tuple[str, Page, dict]:
+        sym = self._norm(symbol)
+        slugs: list[str] = []
+        alias = self._aliases().get(sym)
+        if alias:
+            slugs.append(alias)
+        if _SYMBOL.match(sym):
+            slugs.append(sym)
+        if self._codes.get(sym):
+            slugs.append(self._codes[sym])
+        last_err: Exception = NotFound("No Screener.in company matches '%s'." % symbol)
+        for slug in dict.fromkeys(slugs):
+            try:
+                page, data = self._load(slug, view)
+                self._remember(sym, slug)
+                return slug, page, data
+            except (NotFound, ParseError) as exc:
+                last_err = exc
+        slug = self._search_slug(sym, name)
+        if slug and slug not in slugs:
+            page, data = self._load(slug, view)
+            self._remember(sym, slug)
+            return slug, page, data
+        raise last_err
 
     def _prov(self, page: Page, data: dict) -> dict:
         return page.provenance(view=data.get("view"), units="₹ crore unless stated")
