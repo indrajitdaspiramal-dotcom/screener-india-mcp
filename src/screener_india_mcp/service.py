@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from typing import Optional
 
 from . import analytics, parsers, themes
+from .analytics import _period_keys
 from .client import Page, ScreenerClient
 from .errors import NotFound, ParseError, ScreenerError
 
@@ -39,9 +41,8 @@ THIN_YEARS = 5             # the standalone page is fetched too and the one with
 
 MIN_PRIMARY_QUARTERS = 4  # below this a consolidated page has no trailing-12-month figures, so its P/E etc.
 MIN_PRIMARY_YEARS = 1     # are unreliable and the standalone page is used as the main source instead
+STALE_MONTHS = 9          # a consolidated page whose newest quarter is older than this is checked against standalone
 HISTORY_TABLES = ("quarters", "profit_loss", "balance_sheet", "cash_flow", "ratios_history")
-_MONTHS = {m: i for i, m in enumerate(("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct",
-                                        "nov", "dec"), 1)}
 
 
 def _depth(d: dict) -> tuple[int, int]:
@@ -51,18 +52,24 @@ def _depth(d: dict) -> tuple[int, int]:
     return n("profit_loss"), n("quarters")
 
 
-def _period_keys(table: dict) -> list[Optional[str]]:
-    """'YYYY-MM' per column (from Screener's date keys, else the 'Mar 2024' label); None for TTM etc."""
-    dates = table.get("period_end_dates") or [None] * len(table.get("periods") or [])
-    out = []
-    for label, date in zip(table.get("periods") or [], dates):
-        if date and re.match(r"^\d{4}-\d{2}", str(date)):
-            out.append(str(date)[:7])
-            continue
-        m = re.match(r"^\s*([A-Za-z]{3})[a-z]*\s+(\d{4})\s*$", str(label or ""))
-        out.append("%s-%02d" % (m.group(2), _MONTHS[m.group(1).lower()]) if m and m.group(1).lower() in _MONTHS
-                   else None)
-    return out
+def _latest(data: dict) -> Optional[str]:
+    """'YYYY-MM' of the newest quarter (or, without quarters, the newest dated year) on a parsed page."""
+    for key in ("quarters", "profit_loss"):
+        t = data.get(key)
+        if t and t.get("periods"):
+            keys = [k for k in _period_keys(t) if k]
+            if keys:
+                return max(keys)
+    return None
+
+
+def _recent(key: Optional[str], months: int = STALE_MONTHS) -> bool:
+    """True if a 'YYYY-MM' period is within `months` of today (results are filed within ~2 months of quarter-end)."""
+    if not key:
+        return False
+    y, m = time.localtime()[:2]
+    ky, km = int(key[:4]), int(key[5:7])
+    return (y * 12 + m) - (ky * 12 + km) <= months
 
 
 def _backfill(cons: Optional[dict], stand: Optional[dict]) -> tuple[Optional[dict], int]:
@@ -209,8 +216,8 @@ class Screener:
             last_err = exc
         if cons is not None:
             cy, cq = _depth(cons[1])
-            if cq >= THIN_QUARTERS and cy >= THIN_YEARS:
-                return cons[0], self._stamp(cons[1])
+            if cq >= THIN_QUARTERS and cy >= THIN_YEARS and _recent(_latest(cons[1])):
+                return cons[0], self._stamp(cons[1])    # rich AND current: one request
         try:
             stand = self._fetch_view(slug, "")
         except (NotFound, ParseError) as exc:
@@ -221,6 +228,14 @@ class Screener:
             return stand[0], self._stamp(stand[1])
         cy, cq = _depth(cons[1])
         sy, sq = _depth(stand[1])
+        c_last, s_last = _latest(cons[1]), _latest(stand[1])
+        if c_last and s_last and s_last > c_last:
+            # A company that stopped publishing consolidated results keeps an old consolidated page (KREONFIN's
+            # ended Dec 2017, P/E 913). Never treat it as the latest numbers.
+            data = stand[1]
+            data["view_note"] = ("standalone used: the consolidated page is out of date (latest quarter %s vs "
+                                 "standalone %s)" % (c_last, s_last))
+            return stand[0], self._stamp(data)
         if sy <= cy and sq <= cq:
             return cons[0], self._stamp(cons[1])        # standalone adds nothing
         if cq < MIN_PRIMARY_QUARTERS or cy < MIN_PRIMARY_YEARS:

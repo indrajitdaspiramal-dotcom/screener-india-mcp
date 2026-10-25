@@ -7,10 +7,29 @@ same page always gives the same answer.
 
 from __future__ import annotations
 
+import re
 from typing import Optional
 
 
 # ---------------------------------------------------------------- helpers
+_MONTHS = {m: i for i, m in enumerate(("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct",
+                                        "nov", "dec"), 1)}
+
+
+def _period_keys(table: dict) -> list[Optional[str]]:
+    """'YYYY-MM' per column (from Screener's date keys, else the 'Mar 2024' label); None for TTM etc."""
+    dates = table.get("period_end_dates") or [None] * len(table.get("periods") or [])
+    out = []
+    for label, date in zip(table.get("periods") or [], dates):
+        if date and re.match(r"^\d{4}-\d{2}", str(date)):
+            out.append(str(date)[:7])
+            continue
+        m = re.match(r"^\s*([A-Za-z]{3})[a-z]*\s+(\d{4})\s*$", str(label or ""))
+        out.append("%s-%02d" % (m.group(2), _MONTHS[m.group(1).lower()]) if m and m.group(1).lower() in _MONTHS
+                   else None)
+    return out
+
+
 def _row(table: Optional[dict], *names: str) -> list:
     """First matching row (case-insensitive, prefix match) from a parsed table."""
     if not table:
@@ -92,11 +111,19 @@ def earnings_trend(company: dict, quarters: int = 8) -> dict:
     np_ = _row(q, "net profit")
     eps = _row(q, "eps in rs", "eps")
     basis = q.get("basis") or [None] * len(periods)
+    keys = _period_keys(q)
+    where = {k: j for j, k in enumerate(keys) if k}
     out = []
     for i, p in enumerate(periods):
         def at(series, j=i):
-            return series[j] if 0 <= j < len(series) else None
-        same = i >= 4 and at(basis) == at(basis, i - 4)     # never YoY across standalone -> consolidated
+            return series[j] if j is not None and 0 <= j < len(series) else None
+        # the same period one year earlier, found by date (SME companies report half-yearly, so "4 columns back"
+        # would be two years); falls back to 4 columns back only when the labels carry no dates
+        if keys[i]:
+            prev = where.get("%04d-%s" % (int(keys[i][:4]) - 1, keys[i][5:7]))
+        else:
+            prev = i - 4 if i >= 4 else None
+        same = prev is not None and at(basis) == at(basis, prev)   # never YoY across standalone -> consolidated
         row = {
             "period": p,
             "sales_cr": at(sales),
@@ -104,8 +131,8 @@ def earnings_trend(company: dict, quarters: int = 8) -> dict:
             "opm_pct": at(opm),
             "net_profit_cr": at(np_),
             "eps": at(eps),
-            "sales_yoy_pct": pct_change(at(sales), at(sales, i - 4)) if same else None,
-            "profit_yoy_pct": pct_change(at(np_), at(np_, i - 4)) if same else None,
+            "sales_yoy_pct": pct_change(at(sales), at(sales, prev)) if same else None,
+            "profit_yoy_pct": pct_change(at(np_), at(np_, prev)) if same else None,
         }
         if at(basis):
             row["basis"] = at(basis)
@@ -125,7 +152,7 @@ def earnings_trend(company: dict, quarters: int = 8) -> dict:
         return "steady"
 
     return {"quarters": out, "sales_growth": trend(s_yoy), "profit_growth": trend(p_yoy),
-            "method": "YoY vs same quarter last year; trend = average of last 2 YoY vs the 2 before (±3 pts)."}
+            "method": "YoY vs the same period one year earlier (matched by date); trend = average of last 2 YoY vs the 2 before (±3 pts)."}
 
 
 # ---------------------------------------------------------------- red flags
