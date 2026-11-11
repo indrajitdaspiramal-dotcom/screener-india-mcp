@@ -1,4 +1,6 @@
-"""Settings. Environment variables may make the server MORE polite, never less.
+"""Settings. Environment variables may make the server MORE polite, never less, with one exception: the owner of a
+logged-in account may switch the logged-in DAILY cap off (SCREENER_DAILY_BUDGET=0). The spacing floor between
+requests and the cool-down after any refusal always apply, and the anonymous cap can never be raised.
 
 Hard floors exist on purpose: Screener.in is a small Indian company that serves
 the public for free. A tool that hammers it gets everyone blocked.
@@ -20,7 +22,8 @@ IST = timezone(timedelta(hours=5, minutes=30))
 # Floors / ceilings users cannot override.
 MIN_INTERVAL_FLOOR = 2.0          # seconds between any two requests, machine-wide
 BUDGET_CEILING_ANON = 60          # requests per IST day without a login
-BUDGET_CEILING_AUTH = 1000        # requests per IST day with a login
+BUDGET_CEILING_AUTH = 1000        # requests per IST day with a login (unless the owner switches the cap off)
+UNLIMITED = 10 ** 9               # SCREENER_DAILY_BUDGET=0: no daily cap when logged in (spacing + cool-down still apply)
 
 # Cool-down after Screener refuses us: 30 min, 2 h, 6 h, then 24 h.
 COOLDOWN_STEPS = (30 * 60, 2 * 3600, 6 * 3600, 24 * 3600)
@@ -51,6 +54,13 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def auth_budget(raw: int) -> int:
+    """The logged-in daily budget from SCREENER_DAILY_BUDGET: 0 = no daily cap; otherwise 1..BUDGET_CEILING_AUTH."""
+    if raw == 0:
+        return UNLIMITED
+    return max(1, min(BUDGET_CEILING_AUTH, raw))
+
+
 @dataclass
 class Settings:
     base_url: str = BASE_URL
@@ -66,7 +76,7 @@ class Settings:
         s = cls()
         s.min_interval = max(MIN_INTERVAL_FLOOR, _env_float("SCREENER_MIN_INTERVAL", s.min_interval))
         s.budget_anon = max(1, min(BUDGET_CEILING_ANON, _env_int("SCREENER_DAILY_BUDGET_ANON", s.budget_anon)))
-        s.budget_auth = max(1, min(BUDGET_CEILING_AUTH, _env_int("SCREENER_DAILY_BUDGET", s.budget_auth)))
+        s.budget_auth = auth_budget(_env_int("SCREENER_DAILY_BUDGET", s.budget_auth))
         s.timeout = max(5.0, _env_float("SCREENER_TIMEOUT", s.timeout))
         if os.environ.get("SCREENER_STATE_DIR"):
             s.state_dir = Path(os.environ["SCREENER_STATE_DIR"])

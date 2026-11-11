@@ -2,6 +2,13 @@
 
 All notable changes are documented here (format: [Keep a Changelog](https://keepachangelog.com/)).
 
+## [0.1.3] — 2026-11-11
+
+### Added
+- `SCREENER_DAILY_BUDGET=0` switches the logged-in daily cap off (the account owner's choice). The spacing floor
+  between requests (at least 2 s, machine-wide) and the cool-down after any refusal (30 min, 2 h, 6 h, 24 h) still apply;
+  the anonymous cap is unchanged.
+
 ## [0.1.2] — 2026-10-26
 
 ### Changed

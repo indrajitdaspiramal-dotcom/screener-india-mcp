@@ -107,7 +107,7 @@ Environment variables can make the server **more** polite, never less:
 |---|---|---|
 | `SCREENER_MIN_INTERVAL` | 3 s between requests | never below 2 s |
 | `SCREENER_DAILY_BUDGET_ANON` | 40 requests/day without login | max 60 |
-| `SCREENER_DAILY_BUDGET` | 300 requests/day with login | max 1000 |
+| `SCREENER_DAILY_BUDGET` | 300 requests/day with login | max 1000; `0` = no daily cap (account owner's choice; spacing and cool-down still apply) |
 | `SCREENER_STATE_DIR`, `SCREENER_CACHE_DIR` | OS defaults | — |
 
 Pages are cached locally (company pages 6 h, prices 3 h, search 7 days). When the budget is spent
